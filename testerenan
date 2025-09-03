@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# === Ajuste aqui ===
+RG="rg-hml-brs-monitoria-online-01"
+CLUSTER="aks-hml-brs-app-03"
+OLD_POOL="clickhouse"
+NEW_POOL="clickhouse2"
+NS_BLOCK="alma-platform"
+# ====================
+
+echo "▶️ Conferindo nodepools..."
+az aks nodepool list -g "$RG" --cluster-name "$CLUSTER" -o table
+
+echo "▶️ Backup dos PDBs do namespace $NS_BLOCK..."
+kubectl -n "$NS_BLOCK" get pdb -o yaml > /tmp/${NS_BLOCK}-pdb-backup.yaml || true
+
+echo "▶️ Removendo temporariamente todos os PDBs do namespace $NS_BLOCK..."
+kubectl -n "$NS_BLOCK" delete pdb --all || true
+
+echo "▶️ Listando nós do pool antigo ($OLD_POOL)..."
+NODES_OLD=$(kubectl get nodes -l agentpool="$OLD_POOL" -o name || true)
+echo "$NODES_OLD"
+
+echo "▶️ Cordon em todos os nós do pool antigo..."
+if [[ -n "${NODES_OLD}" ]]; then
+  kubectl cordon -l agentpool="$OLD_POOL"
+else
+  echo "ℹ️ Nenhum nó encontrado no pool $OLD_POOL (pode já ter sido removido)."
+fi
+
+echo "▶️ Drain (ignorando DaemonSets e esvaziando EmptyDir)..."
+if [[ -n "${NODES_OLD}" ]]; then
+  # Drain em todos os nós do pool antigo
+  for n in $NODES_OLD; do
+    NODE_NAME="${n#node/}"
+    echo "→ Draining $NODE_NAME ..."
+    kubectl drain "$NODE_NAME" \
+      --ignore-daemonsets \
+      --delete-emptydir-data \
+      --grace-period=60 \
+      --timeout=20m || true
+  done
+fi
+
+echo "▶️ Forçando deleção de pods presos (se houver)..."
+kubectl get po -A | grep -E "Terminating|CrashLoopBackOff" || true
+# (opcional) deletar os que ficarem presos:
+# kubectl delete pod <POD> -n <NS> --grace-period=0 --force
+
+echo "▶️ Removendo nodepool antigo ($OLD_POOL)..."
+az aks nodepool delete -g "$RG" --cluster-name "$CLUSTER" -n "$OLD_POOL" --no-wait
+
+echo "▶️ Restaurando PDBs..."
+kubectl apply -f /tmp/${NS_BLOCK}-pdb-backup.yaml || true
+
+echo "▶️ Checando nós atuais (pool do novo: $NEW_POOL)..."
+kubectl get nodes -o wide -L agentpool | sort
+
+echo "▶️ Ajustando autoscaler do $NEW_POOL (exemplo: min=1, max=5)..."
+az aks nodepool update -g "$RG" --cluster-name "$CLUSTER" -n "$NEW_POOL" --min-count 1 --max-count 5
+# Se quiser forçar tamanho atual:
+# az aks nodepool scale -g "$RG" --cluster-name "$CLUSTER" -n "$NEW_POOL" --node-count 2
+
+echo "✅ Concluído."
